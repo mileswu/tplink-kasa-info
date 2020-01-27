@@ -1,3 +1,4 @@
+use clap::App;
 use serde_json::json;
 
 async fn get_token() -> String {
@@ -68,7 +69,16 @@ async fn print_device_list(token: &str) {
 
 #[tokio::main]
 async fn main() {
-    let token = get_token().await;
-    print_device_list(token.as_str()).await;
+    let matches = App::new("Query TP-Link Kasa")
+        .subcommand(App::new("list").about("List TP-Link devices registered to your account"))
+        .setting(clap::AppSettings::ArgRequiredElseHelp)
+        .get_matches();
+    match matches.subcommand_name() {
+        Some("list") => {
+            let token = get_token().await;
+            print_device_list(token.as_str()).await;
+        }
+        _ => panic!("Unreachable branch"),
+    }
     return;
 }
