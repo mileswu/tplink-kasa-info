@@ -14,16 +14,37 @@ fn config_path() -> PathBuf {
 pub struct Settings {
     username: String,
     password: String,
+    token: String,
 }
 
-async fn get_token(settings: &Settings) -> String {
-    println!("Fetching token");
+enum LoginDetails {
+    Settings(Settings),
+    UsernameAndPassword(String, String),
+}
+
+fn write_settings(username: &str, password: &str, token: &str) {
+    let settings = Settings {
+        username: username.to_owned(),
+        password: password.to_owned(),
+        token: token.to_owned(),
+    };
+    let toml = toml::to_string(&settings).unwrap();
+    let config_path = config_path();
+    fs::write(&config_path, &toml).unwrap();
+}
+
+async fn get_new_token(login_details: &LoginDetails) -> String {
+    println!("Fetching new token");
+    let (username, password) = match login_details {
+        LoginDetails::Settings(s) => (&s.username, &s.password),
+        LoginDetails::UsernameAndPassword(u, p) => (u, p),
+    };
     let request = json!({
         "method": "login",
         "params": {
             "appType": "Kasa_Android",
-            "cloudUserName": settings.username,
-            "cloudPassword": settings.password,
+            "cloudUserName": username,
+            "cloudPassword": password,
             "terminalUUID": ""
         }
     });
@@ -45,53 +66,13 @@ async fn get_token(settings: &Settings) -> String {
     }
     let result = response["result"].as_object().unwrap();
     let token = result["token"].as_str().unwrap();
+    if let LoginDetails::Settings(_) = login_details {
+        write_settings(username, password, token);
+    };
     return String::from(token);
 }
 
-async fn print_device_list(token: &str) {
-    let request = json!({
-        "method": "getDeviceList"
-    });
-    let client = reqwest::Client::new();
-    let response_text = client
-        .post(&format!(
-            "{}{}",
-            "https://wap.tplinkcloud.com/?token=", token
-        ))
-        .header("Content-Type", "application/json")
-        .body(request.to_string())
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let response: serde_json::Value = serde_json::from_str(&response_text).unwrap();
-    let error_code = response["error_code"].as_i64().unwrap();
-    if error_code != 0 {
-        panic!(
-            "Got error when getting device list (response = {})",
-            response_text
-        );
-    }
-    let result = response["result"].as_object().unwrap();
-    let device_list = result["deviceList"].as_array().unwrap();
-    for i in device_list.iter() {
-        let alias = i["alias"].as_str().unwrap();
-        let device_id = i["deviceId"].as_str().unwrap();
-        println!("{} = {}", alias, device_id);
-    }
-}
-
-fn prompt(text: &str) -> String {
-    print!("{}: ", text);
-    io::stdout().flush().unwrap();
-    let mut value = String::new();
-    io::stdin().read_line(&mut value).unwrap();
-    return value.trim().to_string();
-}
-
-fn setup(username: Option<&str>, password: Option<&str>, overwrite: bool) {
+async fn setup(overwrite: bool) {
     let config_path = config_path();
     if overwrite == false && config_path.exists() {
         panic!(
@@ -99,33 +80,87 @@ fn setup(username: Option<&str>, password: Option<&str>, overwrite: bool) {
             config_path.display()
         );
     }
-    let username = username
-        .map(|i| i.to_string())
-        .unwrap_or_else(|| prompt("Enter your tp-link kasa username"));
-    let password = password
-        .map(|i| i.to_string())
-        .unwrap_or_else(|| prompt("Enter your tp-link kasa password"));
-    let settings = Settings { username, password };
+    fn prompt(text: &str) -> String {
+        print!("{}: ", text);
+        io::stdout().flush().unwrap();
+        let mut value = String::new();
+        io::stdin().read_line(&mut value).unwrap();
+        return value.trim().to_string();
+    }
+    let username = prompt("Enter your tp-link kasa username");
+    let password = prompt("Enter your tp-link kasa password");
+    let token = get_new_token(&LoginDetails::UsernameAndPassword(
+        username.clone(),
+        password.clone(),
+    ))
+    .await;
+    let settings = Settings {
+        username,
+        password,
+        token,
+    };
     let toml = toml::to_string(&settings).unwrap();
     fs::write(&config_path, &toml).unwrap();
 }
 
-fn get_settings(matches: &clap::ArgMatches, args: Vec<&str>) -> Settings {
-    let mut config = config::Config::new();
-    let config_path = config_path();
-    if config_path.exists() {
-        config.merge(config::File::from(config_path)).unwrap();
-    }
-    for arg in &args {
-        match matches.value_of(arg) {
-            Some(v) => {
-                config.set(arg, v).unwrap();
+enum ApiResult {
+    Success,
+    Error(String),
+    TokenExpired,
+}
+
+async fn print_device_list(login_details: &LoginDetails) {
+    async fn go(token: &str) -> ApiResult {
+        let request = json!({
+            "method": "getDeviceList"
+        });
+        let client = reqwest::Client::new();
+        let response_text = client
+            .post(&format!(
+                "{}{}",
+                "https://wap.tplinkcloud.com/?token=", token
+            ))
+            .header("Content-Type", "application/json")
+            .body(request.to_string())
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response_text).unwrap();
+        let error_code = response["error_code"].as_i64().unwrap();
+        if error_code == 0 {
+            let result = response["result"].as_object().unwrap();
+            let device_list = result["deviceList"].as_array().unwrap();
+            for i in device_list.iter() {
+                let alias = i["alias"].as_str().unwrap();
+                let device_id = i["deviceId"].as_str().unwrap();
+                println!("{} = {}", alias, device_id);
             }
-            None => (),
-        };
+            return ApiResult::Success;
+        } else if error_code == -20651 {
+            return ApiResult::TokenExpired;
+        } else {
+            return ApiResult::Error(response_text);
+        }
     }
-    let settings: Settings = config.try_into().unwrap();
-    return settings;
+    async fn fetch_token_and_go(login_details: &LoginDetails) {
+        let token = get_new_token(login_details).await;
+        match go(&token).await {
+            ApiResult::Success => (),
+            ApiResult::TokenExpired => panic!("Token is supposedly expired but we just got it"),
+            ApiResult::Error(e) => panic!(e),
+        }
+    };
+    match login_details {
+        LoginDetails::Settings(s) => match go(&s.token).await {
+            ApiResult::Success => (),
+            ApiResult::TokenExpired => fetch_token_and_go(login_details).await,
+            ApiResult::Error(e) => panic!(e),
+        },
+        LoginDetails::UsernameAndPassword(_, _) => fetch_token_and_go(login_details).await,
+    }
 }
 
 #[tokio::main]
@@ -142,7 +177,6 @@ async fn main() {
             .help("Tp-link kasa password")
             .takes_value(true),
     ];
-    let common_arg_names = vec!["username", "password"];
     let matches = App::new("Query TP-Link Kasa")
         .subcommand(
             App::new("list")
@@ -152,7 +186,6 @@ async fn main() {
         .subcommand(
             App::new("setup")
                 .about("Stores username and password in a settings file")
-                .args(&common_args)
                 .arg(
                     Arg::with_name("overwrite")
                         .short("o")
@@ -163,15 +196,32 @@ async fn main() {
         .get_matches();
     match matches.subcommand() {
         ("list", Some(submatches)) => {
-            let settings = get_settings(&submatches, common_arg_names);
-            let token = get_token(&settings).await;
-            print_device_list(token.as_str()).await;
+            let login_details = match (
+                submatches.value_of("username"),
+                submatches.value_of("password"),
+            ) {
+                (Some(_), None) | (None, Some(_)) => {
+                    panic!("You must pass both a username and password, or neither");
+                }
+                (Some(u), Some(p)) => {
+                    LoginDetails::UsernameAndPassword(String::from(u), String::from(p))
+                }
+                (None, None) => {
+                    let config_path = config_path();
+                    if config_path.exists() {
+                        let settings: Settings =
+                            toml::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+                        LoginDetails::Settings(settings)
+                    } else {
+                        panic!("Config does not exist at {}. Either run the setup command, or pass a username and password via command-line flags", config_path.to_str().unwrap());
+                    }
+                }
+            };
+            print_device_list(&login_details).await;
         }
         ("setup", Some(submatches)) => {
-            let username = submatches.value_of("username");
-            let password = submatches.value_of("password");
             let overwrite = submatches.is_present("overwrite");
-            setup(username, password, overwrite)
+            setup(overwrite).await;
         }
         _ => panic!("Unreachable branch due to clap::AppSettings::ArgRequiredElseHelp"),
     }
