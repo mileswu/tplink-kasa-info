@@ -2,6 +2,7 @@ use clap::{App, Arg};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -109,58 +110,67 @@ enum ApiResult {
     TokenExpired,
 }
 
-async fn print_device_list(login_details: &LoginDetails) {
-    async fn go(token: &str) -> ApiResult {
-        let request = json!({
-            "method": "getDeviceList"
-        });
-        let client = reqwest::Client::new();
-        let response_text = client
-            .post(&format!(
-                "{}{}",
-                "https://wap.tplinkcloud.com/?token=", token
-            ))
-            .header("Content-Type", "application/json")
-            .body(request.to_string())
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
-        let response: serde_json::Value = serde_json::from_str(&response_text).unwrap();
-        let error_code = response["error_code"].as_i64().unwrap();
-        if error_code == 0 {
-            let result = response["result"].as_object().unwrap();
-            let device_list = result["deviceList"].as_array().unwrap();
-            for i in device_list.iter() {
-                let alias = i["alias"].as_str().unwrap();
-                let device_id = i["deviceId"].as_str().unwrap();
-                println!("{} = {}", alias, device_id);
-            }
-            return ApiResult::Success;
-        } else if error_code == -20651 {
-            return ApiResult::TokenExpired;
-        } else {
-            return ApiResult::Error(response_text);
+async fn print_device_list1(token: String) -> ApiResult {
+    let request = json!({
+        "method": "getDeviceList"
+    });
+    let client = reqwest::Client::new();
+    let response_text = client
+        .post(&format!(
+            "{}{}",
+            "https://wap.tplinkcloud.com/?token=", token
+        ))
+        .header("Content-Type", "application/json")
+        .body(request.to_string())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response_text).unwrap();
+    let error_code = response["error_code"].as_i64().unwrap();
+    if error_code == 0 {
+        let result = response["result"].as_object().unwrap();
+        let device_list = result["deviceList"].as_array().unwrap();
+        for i in device_list.iter() {
+            let alias = i["alias"].as_str().unwrap();
+            let device_id = i["deviceId"].as_str().unwrap();
+            println!("{} = {}", alias, device_id);
         }
+        return ApiResult::Success;
+    } else if error_code == -20651 {
+        return ApiResult::TokenExpired;
+    } else {
+        return ApiResult::Error(response_text);
     }
-    async fn fetch_token_and_go(login_details: &LoginDetails) {
+}
+
+async fn runner<T: Future<Output = ApiResult>>(login_details: &LoginDetails, f: fn(String) -> T) {
+    // make this a closure?
+    async fn fetch_token_and_go<T: Future<Output = ApiResult>>(
+        login_details: &LoginDetails,
+        f: fn(String) -> T,
+    ) {
         let token = get_new_token(login_details).await;
-        match go(&token).await {
+        match f(token).await {
             ApiResult::Success => (),
             ApiResult::TokenExpired => panic!("Token is supposedly expired but we just got it"),
             ApiResult::Error(e) => panic!(e),
         }
     };
     match login_details {
-        LoginDetails::Settings(s) => match go(&s.token).await {
+        LoginDetails::Settings(s) => match f(s.token.clone()).await {
             ApiResult::Success => (),
-            ApiResult::TokenExpired => fetch_token_and_go(login_details).await,
+            ApiResult::TokenExpired => fetch_token_and_go(login_details, f).await,
             ApiResult::Error(e) => panic!(e),
         },
-        LoginDetails::UsernameAndPassword(_, _) => fetch_token_and_go(login_details).await,
+        LoginDetails::UsernameAndPassword(_, _) => fetch_token_and_go(login_details, f).await,
     }
+}
+
+async fn print_device_list(login_details: &LoginDetails) {
+    runner(login_details, print_device_list1).await
 }
 
 #[tokio::main]
