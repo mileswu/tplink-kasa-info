@@ -106,14 +106,35 @@ async fn setup(overwrite: bool) {
     fs::write(&config_path, &toml).unwrap();
 }
 
-async fn runner(method: &str, login_details: &LoginDetails) -> serde_json::value::Value {
+async fn runner(
+    request: serde_json::value::Value,
+    arg_matches: &clap::ArgMatches<'_>,
+) -> serde_json::value::Value {
+    let login_details = match (
+        arg_matches.value_of("username"),
+        arg_matches.value_of("password"),
+    ) {
+        (Some(_), None) | (None, Some(_)) => {
+            panic!("You must pass both a username and password, or neither");
+        }
+        (Some(u), Some(p)) => LoginDetails::UsernameAndPassword(String::from(u), String::from(p)),
+        (None, None) => {
+            let config_path = config_path();
+            if config_path.exists() {
+                let settings: Settings =
+                    toml::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+                LoginDetails::Settings(settings)
+            } else {
+                panic!("Config does not exist at {}. Either run the setup command, or pass a username and password via command-line flags", config_path.to_str().unwrap());
+            }
+        }
+    };
     enum ApiResult {
         Success(serde_json::value::Value),
         Error(String),
         TokenExpired,
     }
-    async fn go(method: String, token: String) -> ApiResult {
-        let request = json!({ "method": method });
+    async fn go(request: serde_json::value::Value, token: String) -> ApiResult {
         let client = reqwest::Client::new();
         let response_text = client
             .post(&format!("{}/?token={}", BASE_URL, token))
@@ -137,52 +158,35 @@ async fn runner(method: &str, login_details: &LoginDetails) -> serde_json::value
         }
     };
     async fn fetch_token_and_go<T: Future<Output = ApiResult>>(
-        method: String,
+        request: serde_json::value::Value,
         login_details: &LoginDetails,
-        go: fn(String, String) -> T,
+        go: fn(serde_json::value::Value, String) -> T,
     ) -> serde_json::value::Value {
         let token = get_new_token(login_details).await;
-        match go(method, token).await {
+        match go(request, token).await {
             ApiResult::Success(r) => r,
             ApiResult::TokenExpired => panic!("Token is supposedly expired but we just got it"),
             ApiResult::Error(e) => panic!(e),
         }
     };
     match login_details {
-        LoginDetails::Settings(s) => match go(method.to_owned(), s.token.clone()).await {
-            ApiResult::Success(r) => r,
-            ApiResult::TokenExpired => {
-                fetch_token_and_go(method.to_owned(), login_details, go).await
+        LoginDetails::Settings(ref s) => {
+            let request_clone = request.clone();
+            match go(request_clone, s.token.clone()).await {
+                ApiResult::Success(r) => r,
+                ApiResult::TokenExpired => fetch_token_and_go(request, &login_details, go).await,
+                ApiResult::Error(e) => panic!(e),
             }
-            ApiResult::Error(e) => panic!(e),
-        },
+        }
         LoginDetails::UsernameAndPassword(_, _) => {
-            fetch_token_and_go(method.to_owned(), login_details, go).await
+            fetch_token_and_go(request, &login_details, go).await
         }
     }
 }
 
 async fn print_device_list(arg_matches: &clap::ArgMatches<'_>) {
-    let login_details = match (
-        arg_matches.value_of("username"),
-        arg_matches.value_of("password"),
-    ) {
-        (Some(_), None) | (None, Some(_)) => {
-            panic!("You must pass both a username and password, or neither");
-        }
-        (Some(u), Some(p)) => LoginDetails::UsernameAndPassword(String::from(u), String::from(p)),
-        (None, None) => {
-            let config_path = config_path();
-            if config_path.exists() {
-                let settings: Settings =
-                    toml::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-                LoginDetails::Settings(settings)
-            } else {
-                panic!("Config does not exist at {}. Either run the setup command, or pass a username and password via command-line flags", config_path.to_str().unwrap());
-            }
-        }
-    };
-    let result_value = runner("getDeviceList", &login_details).await;
+    let request = json!({ "method": "getDeviceList" });
+    let result_value = runner(request, arg_matches).await;
     let result = result_value.as_object().unwrap();
     let device_list = result["deviceList"].as_array().unwrap();
     for i in device_list.iter() {
