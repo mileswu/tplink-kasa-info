@@ -11,6 +11,8 @@ fn config_path() -> PathBuf {
     PathBuf::from(format!("{}/.tplink.toml", home))
 }
 
+const BASE_URL: &str = "https://wap.tplinkcloud.com/";
+
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Settings {
     username: String,
@@ -51,7 +53,7 @@ async fn get_new_token(login_details: &LoginDetails) -> String {
     });
     let client = reqwest::Client::new();
     let response_text = client
-        .post("https://wap.tplinkcloud.com")
+        .post(BASE_URL)
         .header("Content-Type", "application/json")
         .body(request.to_string())
         .send()
@@ -104,73 +106,90 @@ async fn setup(overwrite: bool) {
     fs::write(&config_path, &toml).unwrap();
 }
 
-enum ApiResult {
-    Success,
-    Error(String),
-    TokenExpired,
-}
-
-async fn print_device_list1(token: String) -> ApiResult {
-    let request = json!({
-        "method": "getDeviceList"
-    });
-    let client = reqwest::Client::new();
-    let response_text = client
-        .post(&format!(
-            "{}{}",
-            "https://wap.tplinkcloud.com/?token=", token
-        ))
-        .header("Content-Type", "application/json")
-        .body(request.to_string())
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let response: serde_json::Value = serde_json::from_str(&response_text).unwrap();
-    let error_code = response["error_code"].as_i64().unwrap();
-    if error_code == 0 {
-        let result = response["result"].as_object().unwrap();
-        let device_list = result["deviceList"].as_array().unwrap();
-        for i in device_list.iter() {
-            let alias = i["alias"].as_str().unwrap();
-            let device_id = i["deviceId"].as_str().unwrap();
-            println!("{} = {}", alias, device_id);
-        }
-        return ApiResult::Success;
-    } else if error_code == -20651 {
-        return ApiResult::TokenExpired;
-    } else {
-        return ApiResult::Error(response_text);
+async fn runner(method: &str, login_details: &LoginDetails) -> serde_json::value::Value {
+    enum ApiResult {
+        Success(serde_json::value::Value),
+        Error(String),
+        TokenExpired,
     }
-}
-
-async fn runner<T: Future<Output = ApiResult>>(login_details: &LoginDetails, f: fn(String) -> T) {
-    // make this a closure?
+    async fn go(method: String, token: String) -> ApiResult {
+        let request = json!({ "method": method });
+        let client = reqwest::Client::new();
+        let response_text = client
+            .post(&format!("{}/?token={}", BASE_URL, token))
+            .header("Content-Type", "application/json")
+            .body(request.to_string())
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response_text).unwrap();
+        let error_code = response["error_code"].as_i64().unwrap();
+        if error_code == 0 {
+            let result = response["result"].to_owned();
+            return ApiResult::Success(result);
+        } else if error_code == -20651 {
+            return ApiResult::TokenExpired;
+        } else {
+            return ApiResult::Error(response_text);
+        }
+    };
     async fn fetch_token_and_go<T: Future<Output = ApiResult>>(
+        method: String,
         login_details: &LoginDetails,
-        f: fn(String) -> T,
-    ) {
+        go: fn(String, String) -> T,
+    ) -> serde_json::value::Value {
         let token = get_new_token(login_details).await;
-        match f(token).await {
-            ApiResult::Success => (),
+        match go(method, token).await {
+            ApiResult::Success(r) => r,
             ApiResult::TokenExpired => panic!("Token is supposedly expired but we just got it"),
             ApiResult::Error(e) => panic!(e),
         }
     };
     match login_details {
-        LoginDetails::Settings(s) => match f(s.token.clone()).await {
-            ApiResult::Success => (),
-            ApiResult::TokenExpired => fetch_token_and_go(login_details, f).await,
+        LoginDetails::Settings(s) => match go(method.to_owned(), s.token.clone()).await {
+            ApiResult::Success(r) => r,
+            ApiResult::TokenExpired => {
+                fetch_token_and_go(method.to_owned(), login_details, go).await
+            }
             ApiResult::Error(e) => panic!(e),
         },
-        LoginDetails::UsernameAndPassword(_, _) => fetch_token_and_go(login_details, f).await,
+        LoginDetails::UsernameAndPassword(_, _) => {
+            fetch_token_and_go(method.to_owned(), login_details, go).await
+        }
     }
 }
 
-async fn print_device_list(login_details: &LoginDetails) {
-    runner(login_details, print_device_list1).await
+async fn print_device_list(arg_matches: &clap::ArgMatches<'_>) {
+    let login_details = match (
+        arg_matches.value_of("username"),
+        arg_matches.value_of("password"),
+    ) {
+        (Some(_), None) | (None, Some(_)) => {
+            panic!("You must pass both a username and password, or neither");
+        }
+        (Some(u), Some(p)) => LoginDetails::UsernameAndPassword(String::from(u), String::from(p)),
+        (None, None) => {
+            let config_path = config_path();
+            if config_path.exists() {
+                let settings: Settings =
+                    toml::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+                LoginDetails::Settings(settings)
+            } else {
+                panic!("Config does not exist at {}. Either run the setup command, or pass a username and password via command-line flags", config_path.to_str().unwrap());
+            }
+        }
+    };
+    let result_value = runner("getDeviceList", &login_details).await;
+    let result = result_value.as_object().unwrap();
+    let device_list = result["deviceList"].as_array().unwrap();
+    for i in device_list.iter() {
+        let alias = i["alias"].as_str().unwrap();
+        let device_id = i["deviceId"].as_str().unwrap();
+        println!("{} = {}", alias, device_id);
+    }
 }
 
 #[tokio::main]
@@ -206,28 +225,7 @@ async fn main() {
         .get_matches();
     match matches.subcommand() {
         ("list", Some(submatches)) => {
-            let login_details = match (
-                submatches.value_of("username"),
-                submatches.value_of("password"),
-            ) {
-                (Some(_), None) | (None, Some(_)) => {
-                    panic!("You must pass both a username and password, or neither");
-                }
-                (Some(u), Some(p)) => {
-                    LoginDetails::UsernameAndPassword(String::from(u), String::from(p))
-                }
-                (None, None) => {
-                    let config_path = config_path();
-                    if config_path.exists() {
-                        let settings: Settings =
-                            toml::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-                        LoginDetails::Settings(settings)
-                    } else {
-                        panic!("Config does not exist at {}. Either run the setup command, or pass a username and password via command-line flags", config_path.to_str().unwrap());
-                    }
-                }
-            };
-            print_device_list(&login_details).await;
+            print_device_list(submatches).await;
         }
         ("setup", Some(submatches)) => {
             let overwrite = submatches.is_present("overwrite");
