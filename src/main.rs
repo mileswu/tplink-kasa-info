@@ -6,12 +6,18 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-fn config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap();
-    PathBuf::from(format!("{}/.tplink.toml", home))
-}
-
 const BASE_URL: &str = "https://wap.tplinkcloud.com/";
+const DEFAULT_CONFIG_PATH: &str = ".tplink.toml";
+
+fn config_path(config_path_override: &Option<&str>) -> PathBuf {
+    match config_path_override {
+        None => {
+            let home = std::env::var("HOME").unwrap();
+            PathBuf::from(format!("{}/{}", home, DEFAULT_CONFIG_PATH))
+        }
+        Some(path) => PathBuf::from(path),
+    }
+}
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Settings {
@@ -25,18 +31,26 @@ enum LoginDetails {
     UsernameAndPassword(String, String),
 }
 
-fn write_settings(username: &str, password: &str, token: &str) {
+fn write_settings(
+    config_path_override: &Option<&str>,
+    username: &str,
+    password: &str,
+    token: &str,
+) {
     let settings = Settings {
         username: username.to_owned(),
         password: password.to_owned(),
         token: token.to_owned(),
     };
     let toml = toml::to_string(&settings).unwrap();
-    let config_path = config_path();
+    let config_path = config_path(config_path_override);
     fs::write(&config_path, &toml).unwrap();
 }
 
-async fn get_new_token(login_details: &LoginDetails) -> String {
+async fn get_new_token(
+    config_path_override: &Option<&str>,
+    login_details: &LoginDetails,
+) -> String {
     eprintln!("Fetching new token");
     let (username, password) = match login_details {
         LoginDetails::Settings(s) => (&s.username, &s.password),
@@ -70,13 +84,13 @@ async fn get_new_token(login_details: &LoginDetails) -> String {
     let result = response["result"].as_object().unwrap();
     let token = result["token"].as_str().unwrap();
     if let LoginDetails::Settings(_) = login_details {
-        write_settings(username, password, token);
+        write_settings(config_path_override, username, password, token);
     };
     return String::from(token);
 }
 
-async fn setup(overwrite: bool) {
-    let config_path = config_path();
+async fn setup(config_path_override: &Option<&str>, overwrite: bool) {
+    let config_path = config_path(config_path_override);
     if overwrite == false && config_path.exists() {
         panic!(
             "A config already exists at {}. Please remove it if first before running setup again",
@@ -92,24 +106,19 @@ async fn setup(overwrite: bool) {
     }
     let username = prompt("Enter your tp-link kasa username");
     let password = prompt("Enter your tp-link kasa password");
-    let token = get_new_token(&LoginDetails::UsernameAndPassword(
-        username.clone(),
-        password.clone(),
-    ))
+    let token = get_new_token(
+        config_path_override,
+        &LoginDetails::UsernameAndPassword(username.clone(), password.clone()),
+    )
     .await;
-    let settings = Settings {
-        username,
-        password,
-        token,
-    };
-    let toml = toml::to_string(&settings).unwrap();
-    fs::write(&config_path, &toml).unwrap();
+    write_settings(config_path_override, &username, &password, &token);
 }
 
 async fn runner(
     request: serde_json::value::Value,
     arg_matches: &clap::ArgMatches<'_>,
 ) -> serde_json::value::Value {
+    let config_path_override = arg_matches.value_of("config");
     let login_details = match (
         arg_matches.value_of("username"),
         arg_matches.value_of("password"),
@@ -119,13 +128,12 @@ async fn runner(
         }
         (Some(u), Some(p)) => LoginDetails::UsernameAndPassword(String::from(u), String::from(p)),
         (None, None) => {
-            let config_path = config_path();
+            let config_path = config_path(&config_path_override);
             if config_path.exists() {
-                let settings: Settings =
-                    toml::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+                let settings: Settings = toml::from_slice(&fs::read(config_path).unwrap()).unwrap();
                 LoginDetails::Settings(settings)
             } else {
-                panic!("Config does not exist at {}. Either run the setup command, or pass a username and password via command-line flags", config_path.to_str().unwrap());
+                panic!("Config does not exist at {}. Either run the setup command, or pass a username and password via command-line flags", config_path.display());
             }
         }
     };
@@ -159,10 +167,11 @@ async fn runner(
     };
     async fn fetch_token_and_go<T: Future<Output = ApiResult>>(
         request: serde_json::value::Value,
+        config_path_override: &Option<&str>,
         login_details: &LoginDetails,
         go: fn(serde_json::value::Value, String) -> T,
     ) -> serde_json::value::Value {
-        let token = get_new_token(login_details).await;
+        let token = get_new_token(config_path_override, login_details).await;
         match go(request, token).await {
             ApiResult::Success(r) => r,
             ApiResult::TokenExpired => panic!("Token is supposedly expired but we just got it"),
@@ -174,12 +183,14 @@ async fn runner(
             let request_clone = request.clone();
             match go(request_clone, s.token.clone()).await {
                 ApiResult::Success(r) => r,
-                ApiResult::TokenExpired => fetch_token_and_go(request, &login_details, go).await,
+                ApiResult::TokenExpired => {
+                    fetch_token_and_go(request, &config_path_override, &login_details, go).await
+                }
                 ApiResult::Error(e) => panic!(e),
             }
         }
         LoginDetails::UsernameAndPassword(_, _) => {
-            fetch_token_and_go(request, &login_details, go).await
+            fetch_token_and_go(request, &config_path_override, &login_details, go).await
         }
     }
 }
@@ -216,7 +227,16 @@ async fn get_data(arg_matches: &clap::ArgMatches<'_>) {
 
 #[tokio::main]
 async fn main() {
+    let config_help = format!(
+        "Override path to config file (default: ~/{})",
+        DEFAULT_CONFIG_PATH
+    );
+    let config_arg = Arg::with_name("config")
+        .short("c")
+        .value_name("CONFIG")
+        .help(&config_help);
     let common_args = [
+        config_arg.clone(),
         Arg::with_name("username")
             .short("u")
             .value_name("USERNAME")
@@ -249,6 +269,7 @@ async fn main() {
         .subcommand(
             App::new("setup")
                 .about("Stores username and password in a settings file")
+                .arg(&config_arg)
                 .arg(
                     Arg::with_name("overwrite")
                         .short("o")
@@ -265,8 +286,9 @@ async fn main() {
             print_device_list(submatches).await;
         }
         ("setup", Some(submatches)) => {
+            let config_path = submatches.value_of("config");
             let overwrite = submatches.is_present("overwrite");
-            setup(overwrite).await;
+            setup(&config_path, overwrite).await;
         }
         _ => panic!("Unreachable branch due to clap::AppSettings::ArgRequiredElseHelp"),
     }
