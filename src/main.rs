@@ -37,7 +37,7 @@ fn write_settings(username: &str, password: &str, token: &str) {
 }
 
 async fn get_new_token(login_details: &LoginDetails) -> String {
-    println!("Fetching new token");
+    eprintln!("Fetching new token");
     let (username, password) = match login_details {
         LoginDetails::Settings(s) => (&s.username, &s.password),
         LoginDetails::UsernameAndPassword(u, p) => (u, p),
@@ -45,7 +45,7 @@ async fn get_new_token(login_details: &LoginDetails) -> String {
     let request = json!({
         "method": "login",
         "params": {
-            "appType": "Kasa_Android",
+            "appType": "",
             "cloudUserName": username,
             "cloudPassword": password,
             "terminalUUID": ""
@@ -196,6 +196,24 @@ async fn print_device_list(arg_matches: &clap::ArgMatches<'_>) {
     }
 }
 
+async fn get_data(arg_matches: &clap::ArgMatches<'_>) {
+    let device_id = arg_matches.value_of("device-id").unwrap();
+    let request_data = json!({
+            "system": { "get_sysinfo": serde_json::Value::Null },
+            "emeter": { "get_realtime": serde_json::Value::Null }
+    })
+    .to_string();
+    let request = json!({
+        "method": "passthrough",
+        "params" : {
+            "deviceId": device_id,
+            "requestData": request_data
+    } });
+    let result_value = runner(request, arg_matches).await;
+    let response_data = result_value["responseData"].as_str().unwrap();
+    println!("{}", response_data);
+}
+
 #[tokio::main]
 async fn main() {
     let common_args = [
@@ -211,6 +229,18 @@ async fn main() {
             .takes_value(true),
     ];
     let matches = App::new("Query TP-Link Kasa")
+        .subcommand(
+            App::new("get-data")
+                .about("Get data from a TP-Link device")
+                .args(&common_args)
+                .arg(
+                    Arg::with_name("device-id")
+                        .short("d")
+                        .value_name("DEVICE-ID")
+                        .help("device id from <list> command")
+                        .required(true),
+                ),
+        )
         .subcommand(
             App::new("list")
                 .about("List TP-Link devices registered to your account")
@@ -228,6 +258,9 @@ async fn main() {
         .setting(clap::AppSettings::ArgRequiredElseHelp)
         .get_matches();
     match matches.subcommand() {
+        ("get-data", Some(submatches)) => {
+            get_data(submatches).await;
+        }
         ("list", Some(submatches)) => {
             print_device_list(submatches).await;
         }
